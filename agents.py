@@ -1,6 +1,8 @@
 import os
+import time
 from langchain.agents import create_agent
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai.chat_models import GoogleRateLimitError
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from tools import web_search, scrape_url 
@@ -37,6 +39,34 @@ def extract_text(content) -> str:
         return "".join(parts)
     return str(content)
 
+def is_rate_limit_error(e: Exception) -> bool:
+    """Check if exception is caused by API rate limit (429) or high demand (503)."""
+    if isinstance(e, GoogleRateLimitError):
+        return True
+    err_str = str(e).lower()
+    return any(keyword in err_str for keyword in [
+        "ratelimit", "429", "resource_exhausted", "quota", 
+        "too many requests", "spikes in demand", "503", "unavailable"
+    ])
+
+def invoke_with_retry(runnable, input_data, max_attempts=5, initial_wait=8, on_retry=None):
+    """
+    Invoke any LangChain agent or chain with exponential backoff on Gemini rate limits (429/503).
+    """
+    wait_sec = initial_wait
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return runnable.invoke(input_data)
+        except Exception as e:
+            if is_rate_limit_error(e) and attempt < max_attempts:
+                msg = f"⏳ Gemini free tier rate limit reached. Waiting {wait_sec}s before retry ({attempt}/{max_attempts})..."
+                if on_retry:
+                    on_retry(msg)
+                time.sleep(wait_sec)
+                wait_sec = min(wait_sec * 2, 45)
+            else:
+                raise
+
 # Model setup
 api_key = (_setting("GEMINI_API_KEY") or _setting("GOOGLE_API_KEY")).strip().strip('"').strip("'")
 model_name = _setting("GEMINI_MODEL", "gemini-3.5-flash")
@@ -44,7 +74,7 @@ model_name = _setting("GEMINI_MODEL", "gemini-3.5-flash")
 llm = ChatGoogleGenerativeAI(
     model=model_name,
     google_api_key=api_key,
-    max_retries=4,
+    max_retries=6,
 )
 
 # 1st agent 

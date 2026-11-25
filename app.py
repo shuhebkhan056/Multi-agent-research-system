@@ -1,6 +1,6 @@
 import streamlit as st
 import time
-from agents import build_reader_agent, build_search_agent, writer_chain, critic_chain, extract_text
+from agents import build_reader_agent, build_search_agent, writer_chain, critic_chain, extract_text, invoke_with_retry
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -407,52 +407,82 @@ if run_btn:
 if st.session_state.running and not st.session_state.done:
     results = {}
     topic_val = st.session_state.topic_input
+    retry_notice = st.empty()
 
-    # ── Step 1: Search ──
-    with st.spinner("🔍  Search Agent is working…"):
-        search_agent = build_search_agent()
-        sr = search_agent.invoke({
-            "messages": [("user", f"Find recent, reliable and detailed information about: {topic_val}")]
-        })
-        results["search"] = extract_text(sr["messages"][-1].content)
-        st.session_state.results = dict(results)
-    st.rerun() if False else None   # keep inline for now
+    def on_retry_status(msg):
+        retry_notice.warning(msg)
 
-    # ── Step 2: Reader ──
-    with st.spinner("📄  Reader Agent is scraping top resources…"):
-        reader_agent = build_reader_agent()
-        rr = reader_agent.invoke({
-            "messages": [("user",
-                f"Based on the following search results about '{topic_val}', "
-                f"pick the most relevant URL and scrape it for deeper content.\n\n"
-                f"Search Results:\n{results['search'][:800]}"
-            )]
-        })
-        results["reader"] = extract_text(rr["messages"][-1].content)
-        st.session_state.results = dict(results)
+    try:
+        # ── Step 1: Search ──
+        with st.spinner("🔍  Search Agent is working…"):
+            search_agent = build_search_agent()
+            sr = invoke_with_retry(search_agent, {
+                "messages": [("user", f"Find recent, reliable and detailed information about: {topic_val}")]
+            }, on_retry=on_retry_status)
+            results["search"] = extract_text(sr["messages"][-1].content)
+            st.session_state.results = dict(results)
+            retry_notice.empty()
 
-    # ── Step 3: Writer ──
-    with st.spinner("✍️  Writer is drafting the report…"):
-        research_combined = (
-            f"SEARCH RESULTS:\n{results['search']}\n\n"
-            f"DETAILED SCRAPED CONTENT:\n{results['reader']}"
-        )
-        results["writer"] = extract_text(writer_chain.invoke({
-            "topic": topic_val,
-            "research": research_combined
-        }))
-        st.session_state.results = dict(results)
+        time.sleep(2)  # Short cooldown to respect Gemini RPM quota
 
-    # ── Step 4: Critic ──
-    with st.spinner("🧐  Critic is reviewing the report…"):
-        results["critic"] = extract_text(critic_chain.invoke({
-            "report": results["writer"]
-        }))
-        st.session_state.results = dict(results)
+        # ── Step 2: Reader ──
+        with st.spinner("📄  Reader Agent is scraping top resources…"):
+            reader_agent = build_reader_agent()
+            rr = invoke_with_retry(reader_agent, {
+                "messages": [("user",
+                    f"Based on the following search results about '{topic_val}', "
+                    f"pick the most relevant URL and scrape it for deeper content.\n\n"
+                    f"Search Results:\n{results['search'][:800]}"
+                )]
+            }, on_retry=on_retry_status)
+            results["reader"] = extract_text(rr["messages"][-1].content)
+            st.session_state.results = dict(results)
+            retry_notice.empty()
 
-    st.session_state.running = False
-    st.session_state.done = True
-    st.rerun()
+        time.sleep(2)  # Short cooldown to respect Gemini RPM quota
+
+        # ── Step 3: Writer ──
+        with st.spinner("✍️  Writer is drafting the report…"):
+            research_combined = (
+                f"SEARCH RESULTS:\n{results['search']}\n\n"
+                f"DETAILED SCRAPED CONTENT:\n{results['reader']}"
+            )
+            report_out = invoke_with_retry(writer_chain, {
+                "topic": topic_val,
+                "research": research_combined
+            }, on_retry=on_retry_status)
+            results["writer"] = extract_text(report_out)
+            st.session_state.results = dict(results)
+            retry_notice.empty()
+
+        time.sleep(2)  # Short cooldown to respect Gemini RPM quota
+
+        # ── Step 4: Critic ──
+        with st.spinner("🧐  Critic is reviewing the report…"):
+            critic_out = invoke_with_retry(critic_chain, {
+                "report": results["writer"]
+            }, on_retry=on_retry_status)
+            results["critic"] = extract_text(critic_out)
+            st.session_state.results = dict(results)
+            retry_notice.empty()
+
+        st.session_state.running = False
+        st.session_state.done = True
+        st.rerun()
+
+    except Exception as e:
+        st.session_state.running = False
+        retry_notice.empty()
+        err_msg = str(e)
+        if any(w in err_msg.lower() for w in ["ratelimit", "429", "resource_exhausted", "quota"]):
+            st.error(
+                "⏳ **Gemini API Rate Limit (Free Tier) Reached**\n\n"
+                "Google AI Studio's free tier allows a limited number of requests per minute (RPM). "
+                "The pipeline retried automatically, but the quota limit was still active. "
+                "Please wait **1–2 minutes** and try again."
+            )
+        else:
+            st.error(f"❌ **Error running research pipeline:** {err_msg}")
 
 
 # ── Results display ───────────────────────────────────────────────────────────
